@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Extension binaries
+*.so
+
+# Editor/OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
