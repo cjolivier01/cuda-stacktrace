@@ -115,6 +115,15 @@ static PyObject *g_format_stack_fn = nullptr;
 // callbacks
 thread_local bool tls_in_callback = false;
 
+// Optional thread filtering: only log when callback occurs on selected
+// Python thread idents. If g_filter_only_current_thread is true, then only the
+// thread that called enable() (whose ident is captured) is allowed. If
+// g_allowed_thread_idents is non-empty, any thread ident within is allowed.
+static std::atomic<bool> g_filter_only_current_thread{false};
+static long g_enable_thread_ident = -1; // ident captured at enable()
+static std::unordered_set<long> g_allowed_thread_idents; // optional allow-list
+static std::mutex g_threads_mu;
+
 // ---------- Python stack printing ----------
 
 // Try to join a Python list[str] into a single UTF-8 std::string without
@@ -217,8 +226,27 @@ extern "C" void CUPTIAPI cupti_callback(void * /*userdata*/,
 
   tls_in_callback = true;
 
-  // Acquire GIL and attempt to format Python stack from this OS thread.
+  // Acquire GIL (needed both for optional thread filtering and stack capture).
   PyGILState_STATE gil_state = PyGILState_Ensure();
+
+  // Optional thread filtering: require the callback to run on one of the
+  // allowed Python thread idents.
+  if (g_filter_only_current_thread.load() || !g_allowed_thread_idents.empty()) {
+    long cur_ident = PyThread_get_thread_ident();
+    bool ok = true;
+    if (g_filter_only_current_thread.load()) {
+      ok = (cur_ident == g_enable_thread_ident);
+    }
+    if (ok && !g_allowed_thread_idents.empty()) {
+      std::lock_guard<std::mutex> lock(g_threads_mu);
+      ok = (g_allowed_thread_idents.find(cur_ident) != g_allowed_thread_idents.end());
+    }
+    if (!ok) {
+      PyGILState_Release(gil_state);
+      tls_in_callback = false;
+      return;
+    }
+  }
 
   // Determine whether this thread has Python frames.
   PyObject *frame = get_current_frame_held_GIL(); // new ref (or NULL)
@@ -360,12 +388,17 @@ static bool convert_iterable_of_str(PyObject *obj,
 
 static PyObject *py_enable(PyObject * /*self*/, PyObject *args,
                            PyObject *kwargs) {
-  static const char *kwlist[] = {"api_names", "domains", "site", nullptr};
+  static const char *kwlist[] = {"api_names", "domains", "site",
+                                 "only_current_thread", "thread_idents",
+                                 nullptr};
   PyObject *api_names = nullptr;
   PyObject *domains = nullptr;
   const char *site = "enter";
-  if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|Os", (char **)kwlist,
-                                   &api_names, &domains, &site)) {
+  int only_current_thread = 0;
+  PyObject *thread_idents = nullptr;
+  if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|OspO", (char **)kwlist,
+                                   &api_names, &domains, &site,
+                                   &only_current_thread, &thread_idents)) {
     return nullptr;
   }
 
@@ -417,6 +450,45 @@ static PyObject *py_enable(PyObject * /*self*/, PyObject *args,
     return nullptr;
   }
 
+  // Thread filters
+  g_filter_only_current_thread.store(only_current_thread != 0);
+  if (g_filter_only_current_thread.load()) {
+    // Capture the ident of the Python thread that invoked enable().
+    g_enable_thread_ident = PyThread_get_thread_ident();
+  } else {
+    g_enable_thread_ident = -1;
+  }
+  {
+    std::lock_guard<std::mutex> lock(g_threads_mu);
+    g_allowed_thread_idents.clear();
+  }
+  if (thread_idents && thread_idents != Py_None) {
+    PyObject *it = PyObject_GetIter(thread_idents);
+    if (!it) {
+      PyErr_SetString(PyExc_TypeError, "thread_idents must be an iterable of int");
+      return nullptr;
+    }
+    PyObject *item;
+    std::unordered_set<long> tmp;
+    while ((item = PyIter_Next(it))) {
+      long long v = PyLong_AsLongLong(item);
+      Py_DECREF(item);
+      if (PyErr_Occurred()) {
+        Py_DECREF(it);
+        PyErr_SetString(PyExc_TypeError, "thread_idents contains non-integer");
+        return nullptr;
+      }
+      tmp.insert((long)v);
+    }
+    Py_DECREF(it);
+    if (PyErr_Occurred())
+      return nullptr;
+    if (!tmp.empty()) {
+      std::lock_guard<std::mutex> lock(g_threads_mu);
+      g_allowed_thread_idents.swap(tmp);
+    }
+  }
+
   try {
     subscribe_if_needed(runtime, driver);
   } catch (const std::exception &e) {
@@ -430,6 +502,13 @@ static PyObject *py_enable(PyObject * /*self*/, PyObject *args,
 static PyObject *py_disable(PyObject * /*self*/, PyObject * /*args*/) {
   g_enabled.store(false);
   unsubscribe_if_needed();
+  // Clear thread filters
+  g_filter_only_current_thread.store(false);
+  g_enable_thread_ident = -1;
+  {
+    std::lock_guard<std::mutex> lock(g_threads_mu);
+    g_allowed_thread_idents.clear();
+  }
   Py_RETURN_NONE;
 }
 

@@ -7,6 +7,7 @@ Features
 - Watch specific APIs (e.g., `cudaMalloc`, `cudaMemcpy`, `cudaLaunchKernel`) or all in a domain.
 - Domains: `"runtime"` and/or `"driver"`.
 - Callback site: `"enter"` or `"exit"`.
+- Optional thread filtering: only report for the thread that enabled tracing or a list of thread idents.
 - Enable/disable from Python at runtime.
 - Output goes to `stderr` with a clear prefix.
 
@@ -61,15 +62,23 @@ You can change domains and site:
 ```
 
 Python API
-- `enable(api_names, domains=("runtime",), site="enter")`
+- `enable(api_names, domains=("runtime",), site="enter", only_current_thread=False, thread_idents=None)`
 - `disable()`
 - `set_functions(api_names)`
 - `is_enabled() -> bool`
+
+Thread filtering
+- `only_current_thread=True` restricts logging to the Python thread that calls `enable(...)`.
+- `thread_idents` accepts an iterable of integers matching `threading.get_ident()` values; logging occurs only on those threads.
+- If both are provided, a callback is logged if it matches either condition.
 
 Notes:
 - If `api_names` is empty, all APIs in the chosen domain(s) are logged.
 - Output is written to `stderr`.
 - If you see `CUPTI_ERROR_NOT_INITIALIZED`, ensure the CUDA driver is initialized (`nvidia-smi` should work) and `libcupti` is in your library path.
+
+Limitations
+- Stream-based filtering is not supported in this build. Determining the CUDA stream for arbitrary API calls via CUPTI callbacks requires decoding per-API parameter structures, which this extension intentionally avoids to keep build-time dependencies low and maintain compatibility across CUDA versions. If you need stream filtering, please open an issue to discuss enabling a CUDA/CUPTI header–based build that can parse function parameters for common async APIs.
 
 Tests
 - Run tests (they will skip gracefully when CUPTI isn’t available):
@@ -83,4 +92,3 @@ Implementation Notes
 - Uses CUPTI callback API and only accesses the `callbackSite` and `functionName` fields for compatibility.
 - Acquires the Python GIL in the callback and formats the stack via `traceback.format_stack`.
 - A small reentrancy guard prevents recursive callbacks during printing.
-
