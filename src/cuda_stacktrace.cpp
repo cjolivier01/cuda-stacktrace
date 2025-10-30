@@ -239,7 +239,8 @@ extern "C" void CUPTIAPI cupti_callback(void * /*userdata*/,
     }
     if (ok && !g_allowed_thread_idents.empty()) {
       std::lock_guard<std::mutex> lock(g_threads_mu);
-      ok = (g_allowed_thread_idents.find(cur_ident) != g_allowed_thread_idents.end());
+      ok = (g_allowed_thread_idents.find(cur_ident) !=
+            g_allowed_thread_idents.end());
     }
     if (!ok) {
       PyGILState_Release(gil_state);
@@ -265,7 +266,9 @@ extern "C" void CUPTIAPI cupti_callback(void * /*userdata*/,
   ensure_traceback_objects_held_GIL();
 
   std::string header;
-  header.reserve(128);
+  header.reserve(1024);
+  header += "=================================================================="
+            "=======\n";
   header += "[cuda_stacktrace] ";
   header += domain_str(domain);
   header += "/";
@@ -273,6 +276,8 @@ extern "C" void CUPTIAPI cupti_callback(void * /*userdata*/,
   header += " ";
   header += (cbInfo->functionName ? cbInfo->functionName : "(unknown)");
   header += "\n";
+  header += "------------------------------------------------------------------"
+            "-------\n";
 
   if (g_format_stack_fn) {
     // Call traceback.format_stack(frame)
@@ -296,7 +301,11 @@ extern "C" void CUPTIAPI cupti_callback(void * /*userdata*/,
                  header.c_str());
     std::fflush(stderr);
   }
-
+  std::string footer;
+  footer.reserve(1024);
+  footer += "=================================================================="
+            "=======\n";
+  std::fprintf(stderr, "%s\n", footer.c_str());
   PyGILState_Release(gil_state);
   tls_in_callback = false;
 }
@@ -388,9 +397,9 @@ static bool convert_iterable_of_str(PyObject *obj,
 
 static PyObject *py_enable(PyObject * /*self*/, PyObject *args,
                            PyObject *kwargs) {
-  static const char *kwlist[] = {"api_names", "domains", "site",
-                                 "only_current_thread", "thread_idents",
-                                 nullptr};
+  static const char *kwlist[] = {"api_names",     "domains",
+                                 "site",          "only_current_thread",
+                                 "thread_idents", nullptr};
   PyObject *api_names = nullptr;
   PyObject *domains = nullptr;
   const char *site = "enter";
@@ -465,7 +474,8 @@ static PyObject *py_enable(PyObject * /*self*/, PyObject *args,
   if (thread_idents && thread_idents != Py_None) {
     PyObject *it = PyObject_GetIter(thread_idents);
     if (!it) {
-      PyErr_SetString(PyExc_TypeError, "thread_idents must be an iterable of int");
+      PyErr_SetString(PyExc_TypeError,
+                      "thread_idents must be an iterable of int");
       return nullptr;
     }
     PyObject *item;
@@ -548,11 +558,6 @@ static struct PyModuleDef moduledef = {
     // Fully qualified module name to live under the Python package
     "cuda_stacktrace._native",
     "Print Python stack whenever selected CUDA APIs are called (via CUPTI).",
-    -1,
-    module_methods,
-    nullptr,
-    nullptr,
-    nullptr,
-    nullptr};
+    -1, module_methods, nullptr, nullptr, nullptr, nullptr};
 
 PyMODINIT_FUNC PyInit__native(void) { return PyModule_Create(&moduledef); }

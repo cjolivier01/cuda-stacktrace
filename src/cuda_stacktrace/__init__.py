@@ -16,7 +16,7 @@ Notes:
 from __future__ import annotations
 
 from contextlib import redirect_stderr
-from typing import Iterable, Optional, Iterable as _Iterable
+from typing import Iterable, Optional, Union, Iterable as _Iterable
 import warnings
 
 try:
@@ -101,7 +101,7 @@ class CudaStackTracer:
     def __init__(
         self,
         *,
-        functions: Optional[Iterable[str]] = None,
+        functions: Optional[Union[str, Iterable[str]]] = None,
         enabled: bool = True,
         only_current_thread: Optional[bool] = None,
         local_thread_only: Optional[bool] = None,
@@ -109,7 +109,11 @@ class CudaStackTracer:
         site: str = "enter",
         stream=None,
     ) -> None:
-        self.functions = list(functions) if functions is not None else []
+        self.functions = (
+            [functions]
+            if isinstance(functions, str)
+            else list(functions) if functions is not None else []
+        )
         self.enabled = bool(enabled)
         # Prefer only_current_thread; keep local_thread_only as deprecated alias
         if only_current_thread is None and local_thread_only is not None:
@@ -119,7 +123,9 @@ class CudaStackTracer:
                 stacklevel=2,
             )
             only_current_thread = bool(local_thread_only)
-        self.only_current_thread = bool(only_current_thread) if only_current_thread is not None else False
+        self.only_current_thread = (
+            bool(only_current_thread) if only_current_thread is not None else False
+        )
         self.domains = tuple(domains) if domains is not None else None
         self.site = site
         self.stream = stream
