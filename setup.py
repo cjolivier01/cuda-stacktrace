@@ -1,4 +1,4 @@
-from setuptools import setup, Extension
+from setuptools import setup, Extension, find_packages
 import os, platform
 
 CUDA_HOME = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH") or "/usr/local/cuda"
@@ -31,7 +31,8 @@ else:
 
 ext_modules = [
     Extension(
-        name="cuda_stacktrace",
+        # Build the native extension as a submodule inside the package
+        name="cuda_stacktrace._native",
         sources=["src/cuda_stacktrace.cpp"],
         include_dirs=include_dirs,
         libraries=libraries,
@@ -46,6 +47,8 @@ setup(
     version="0.1.0",
     description="Print the Python call stack when selected CUDA APIs are called (via CUPTI).",
     long_description="",
+    packages=find_packages("src"),
+    package_dir={"": "src"},
     ext_modules=ext_modules,
     zip_safe=False,
 )

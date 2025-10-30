@@ -466,7 +466,8 @@ static PyMethodDef module_methods[] = {
 
 static struct PyModuleDef moduledef = {
     PyModuleDef_HEAD_INIT,
-    "cuda_stacktrace",
+    // Fully qualified module name to live under the Python package
+    "cuda_stacktrace._native",
     "Print Python stack whenever selected CUDA APIs are called (via CUPTI).",
     -1,
     module_methods,
@@ -475,6 +476,4 @@ static struct PyModuleDef moduledef = {
     nullptr,
     nullptr};
 
-PyMODINIT_FUNC PyInit_cuda_stacktrace(void) {
-  return PyModule_Create(&moduledef);
-}
+PyMODINIT_FUNC PyInit__native(void) { return PyModule_Create(&moduledef); }
