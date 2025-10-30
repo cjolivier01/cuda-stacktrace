@@ -3,22 +3,21 @@ User-friendly Python API for CUDA stack tracing via CUPTI.
 
 This package wraps the native extension (cuda_stacktrace._native) and exposes:
 
-- enable(functions, domains=("runtime",), site="enter") / disable() / is_enabled()
-- set_functions(functions)
+- enable(api_names, domains=("runtime",), site="enter", only_current_thread=False, thread_idents=None)
+- disable() / is_enabled()
+- set_functions(api_names)
 - CudaStackTracer context manager for scoped tracing
 
 Notes:
-- local_thread_only: Currently the extension only captures the stack of the
-  OS thread invoking the CUDA API (i.e., local thread). This parameter is
-  accepted for forward compatibility and to mirror desired API shape.
 - stream: If provided, stderr is temporarily redirected to the given stream
   within the context manager, so native output is captured there.
 """
 
 from __future__ import annotations
 
-from contextlib import contextmanager, redirect_stderr
-from typing import Iterable, Optional
+from contextlib import redirect_stderr
+from typing import Iterable, Optional, Iterable as _Iterable
+import warnings
 
 try:
     from . import _native as _ext
@@ -29,18 +28,28 @@ except Exception as e:  # pragma: no cover - import-time failure
 
 
 def enable(
-    functions: Iterable[str],
+    api_names: Iterable[str],
     *,
     domains: Iterable[str] | None = ("runtime",),
     site: str = "enter",
+    only_current_thread: bool = False,
+    thread_idents: Optional[_Iterable[int]] = None,
 ) -> None:
     """Enable stack printing for selected CUDA API names.
 
-    - functions: iterable of CUDA API names to watch (exact names)
+    - api_names: iterable of CUDA API names to watch (exact names)
     - domains: ("runtime",), ("driver",), or ("runtime", "driver")
     - site: "enter" or "exit"
+    - only_current_thread: if True, only log for the thread that called enable()
+    - thread_idents: iterable of Python thread idents (ints) to allow
     """
-    _ext.enable(functions, domains=tuple(domains) if domains is not None else None, site=site)
+    _ext.enable(
+        api_names,
+        domains=tuple(domains) if domains is not None else None,
+        site=site,
+        only_current_thread=bool(only_current_thread),
+        thread_idents=list(thread_idents) if thread_idents is not None else None,
+    )
 
 
 def disable() -> None:
@@ -59,13 +68,21 @@ def set_functions(functions: Iterable[str]) -> None:
 
 
 def start(
-    functions: Iterable[str],
+    api_names: Iterable[str],
     *,
     domains: Iterable[str] | None = ("runtime",),
     site: str = "enter",
+    only_current_thread: bool = False,
+    thread_idents: Optional[_Iterable[int]] = None,
 ) -> None:
-    """Alias for enable(functions, domains=..., site=...)."""
-    enable(functions, domains=domains, site=site)
+    """Alias for enable(api_names, domains=..., site=...)."""
+    enable(
+        api_names,
+        domains=domains,
+        site=site,
+        only_current_thread=only_current_thread,
+        thread_idents=thread_idents,
+    )
 
 
 def stop() -> None:
@@ -86,14 +103,23 @@ class CudaStackTracer:
         *,
         functions: Optional[Iterable[str]] = None,
         enabled: bool = True,
-        local_thread_only: bool = True,
+        only_current_thread: Optional[bool] = None,
+        local_thread_only: Optional[bool] = None,
         domains: Iterable[str] | None = ("runtime",),
         site: str = "enter",
         stream=None,
     ) -> None:
         self.functions = list(functions) if functions is not None else []
         self.enabled = bool(enabled)
-        self.local_thread_only = bool(local_thread_only)  # currently only mode supported
+        # Prefer only_current_thread; keep local_thread_only as deprecated alias
+        if only_current_thread is None and local_thread_only is not None:
+            warnings.warn(
+                "'local_thread_only' is deprecated; use 'only_current_thread'",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            only_current_thread = bool(local_thread_only)
+        self.only_current_thread = bool(only_current_thread) if only_current_thread is not None else False
         self.domains = tuple(domains) if domains is not None else None
         self.site = site
         self.stream = stream
@@ -108,7 +134,12 @@ class CudaStackTracer:
 
         if self.enabled:
             try:
-                enable(self.functions, domains=self.domains, site=self.site)
+                enable(
+                    self.functions,
+                    domains=self.domains,
+                    site=self.site,
+                    only_current_thread=self.only_current_thread,
+                )
             except RuntimeError:
                 # Re-raise to make failures explicit within context usage
                 raise
@@ -128,4 +159,3 @@ class CudaStackTracer:
             disable()
         # If it was previously enabled, we leave it as-is
         return False
-

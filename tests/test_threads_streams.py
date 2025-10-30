@@ -4,6 +4,7 @@ import os
 import threading
 import time
 import pytest
+import sys
 
 
 def have_lib(name_candidates):
@@ -30,20 +31,38 @@ def import_cst():
         import cuda_stacktrace as m  # type: ignore
         return m
     except Exception:
-        # Fallback: load from local built .so
-        candidates = glob.glob(os.path.join(os.path.dirname(__file__), "..", "cuda_stacktrace*.so"))
-        candidates += glob.glob(os.path.join(os.getcwd(), "cuda_stacktrace*.so"))
-        candidates = [os.path.abspath(p) for p in candidates]
-        if not candidates:
-            raise
-        path = candidates[0]
-        import importlib.util
+        # Fallback 1: add local src + build/lib.* to sys.path and try package import
+        root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        src_dir = os.path.join(root, "src")
+        if src_dir not in sys.path:
+            sys.path.insert(0, src_dir)
+        cand_build = os.path.join(root, "build")
+        build_dirs = []
+        if os.path.isdir(cand_build):
+            for name in os.listdir(cand_build):
+                if name.startswith("lib."):
+                    build_dirs.append(os.path.join(cand_build, name))
+        for p in build_dirs:
+            if p not in sys.path:
+                sys.path.insert(0, p)
+        try:
+            import cuda_stacktrace as m2  # type: ignore
+            return m2
+        except Exception:
+            # Fallback 2: load from a top-level built .so if present
+            candidates = glob.glob(os.path.join(os.path.dirname(__file__), "..", "cuda_stacktrace*.so"))
+            candidates += glob.glob(os.path.join(os.getcwd(), "cuda_stacktrace*.so"))
+            candidates = [os.path.abspath(p) for p in candidates]
+            if not candidates:
+                raise
+            path = candidates[0]
+            import importlib.util
 
-        spec = importlib.util.spec_from_file_location("cuda_stacktrace", path)
-        assert spec and spec.loader
-        m = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(m)  # type: ignore
-        return m
+            spec = importlib.util.spec_from_file_location("cuda_stacktrace", path)
+            assert spec and spec.loader
+            m3 = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(m3)  # type: ignore
+            return m3
 
 
 def get_libcudart_or_skip():
@@ -212,4 +231,3 @@ def test_stream_ops_only_current_thread_filters_other_threads(capfd):
     out2 = capfd.readouterr().err
     cst.disable()
     assert "cudaStreamCreate" not in out2 and "cudaStreamSynchronize" not in out2
-
