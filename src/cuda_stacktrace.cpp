@@ -110,6 +110,7 @@ static std::atomic<CUpti_ApiCallbackSite> g_site{CUPTI_API_ENTER};
 // Python objects cached (borrowed/owned refs)
 static PyObject *g_traceback_mod = nullptr;
 static PyObject *g_format_stack_fn = nullptr;
+static PyObject *g_extract_stack_fn = nullptr;
 
 // Small reentrancy guard to avoid recursion if Python printing triggers
 // callbacks
@@ -123,6 +124,12 @@ static std::atomic<bool> g_filter_only_current_thread{false};
 static long g_enable_thread_ident = -1; // ident captured at enable()
 static std::unordered_set<long> g_allowed_thread_idents; // optional allow-list
 static std::mutex g_threads_mu;
+
+// Optional: only print the first stack per originating Python callsite
+// (filename + line number of the bottommost Python frame).
+static std::atomic<bool> g_once_per_line{false};
+static std::unordered_set<std::string> g_seen_callsites;
+static std::mutex g_callsites_mu;
 
 // ---------- Python stack printing ----------
 
@@ -154,17 +161,29 @@ static std::string py_list_join_to_string(PyObject *list_obj) {
 }
 
 static void ensure_traceback_objects_held_GIL() {
-  if (g_traceback_mod && g_format_stack_fn)
+  if (g_traceback_mod && g_format_stack_fn && g_extract_stack_fn)
     return;
-  g_traceback_mod = PyImport_ImportModule("traceback");
   if (!g_traceback_mod) {
-    PyErr_Clear();
-    return;
+    g_traceback_mod = PyImport_ImportModule("traceback");
+    if (!g_traceback_mod) {
+      PyErr_Clear();
+      return;
+    }
   }
-  g_format_stack_fn = PyObject_GetAttrString(g_traceback_mod, "format_stack");
   if (!g_format_stack_fn) {
-    PyErr_Clear();
-    Py_CLEAR(g_traceback_mod);
+    g_format_stack_fn = PyObject_GetAttrString(g_traceback_mod, "format_stack");
+    if (!g_format_stack_fn) {
+      PyErr_Clear();
+      Py_CLEAR(g_traceback_mod);
+      return;
+    }
+  }
+  if (!g_extract_stack_fn) {
+    g_extract_stack_fn = PyObject_GetAttrString(g_traceback_mod, "extract_stack");
+    if (!g_extract_stack_fn) {
+      PyErr_Clear();
+      // keep going; dedupe feature becomes unavailable
+    }
   }
 }
 
@@ -280,6 +299,61 @@ extern "C" void CUPTIAPI cupti_callback(void * /*userdata*/,
             "-------\n";
 
   if (g_format_stack_fn) {
+    // If once-per-line mode is enabled, attempt to extract the bottommost
+    // frame's filename+lineno and dedupe on that key.
+    if (g_once_per_line.load() && g_extract_stack_fn) {
+      PyObject *summ_list = PyObject_CallFunction(g_extract_stack_fn, "O", frame);
+      if (!summ_list) {
+        PyErr_Clear();
+      } else if (PyList_Check(summ_list) && PyList_Size(summ_list) > 0) {
+        PyObject *last = PyList_GetItem(summ_list, PyList_Size(summ_list) - 1); // borrowed
+        if (last) {
+          PyObject *filename = PyObject_GetAttrString(last, "filename");
+          PyObject *lineno = PyObject_GetAttrString(last, "lineno");
+          const char *fname = nullptr;
+          long line = -1;
+          if (filename) {
+            fname = PyUnicode_Check(filename) ? PyUnicode_AsUTF8(filename) : nullptr;
+          }
+          if (lineno) {
+            if (PyLong_Check(lineno))
+              line = PyLong_AsLong(lineno);
+          }
+          if (fname && line >= 0 && !PyErr_Occurred()) {
+            std::string key(fname);
+            key.push_back(':');
+            key.append(std::to_string(line));
+            bool seen = false;
+            {
+              std::lock_guard<std::mutex> lock(g_callsites_mu);
+              auto it = g_seen_callsites.find(key);
+              if (it != g_seen_callsites.end()) {
+                seen = true;
+              } else {
+                g_seen_callsites.insert(std::move(key));
+              }
+            }
+            if (seen) {
+              // Skip printing entirely; cleanup and exit without emitting header/footer.
+              Py_DECREF(frame);
+              Py_DECREF(summ_list);
+              if (filename)
+                Py_DECREF(filename);
+              if (lineno)
+                Py_DECREF(lineno);
+              PyGILState_Release(gil_state);
+              tls_in_callback = false;
+              return;
+            }
+          }
+          if (filename)
+            Py_DECREF(filename);
+          if (lineno)
+            Py_DECREF(lineno);
+        }
+        Py_DECREF(summ_list);
+      }
+    }
     // Call traceback.format_stack(frame)
     PyObject *list_obj = PyObject_CallFunction(g_format_stack_fn, "O", frame);
     Py_DECREF(frame);
@@ -399,15 +473,18 @@ static PyObject *py_enable(PyObject * /*self*/, PyObject *args,
                            PyObject *kwargs) {
   static const char *kwlist[] = {"api_names",     "domains",
                                  "site",          "only_current_thread",
-                                 "thread_idents", nullptr};
+                                 "thread_idents", "once_per_line",
+                                 nullptr};
   PyObject *api_names = nullptr;
   PyObject *domains = nullptr;
   const char *site = "enter";
   int only_current_thread = 0;
   PyObject *thread_idents = nullptr;
-  if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|OspO", (char **)kwlist,
+  int once_per_line = 0;
+  if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|OspOi", (char **)kwlist,
                                    &api_names, &domains, &site,
-                                   &only_current_thread, &thread_idents)) {
+                                   &only_current_thread, &thread_idents,
+                                   &once_per_line)) {
     return nullptr;
   }
 
@@ -505,6 +582,12 @@ static PyObject *py_enable(PyObject * /*self*/, PyObject *args,
     PyErr_SetString(PyExc_RuntimeError, e.what());
     return nullptr;
   }
+  // Configure once-per-line dedupe state
+  g_once_per_line.store(once_per_line != 0);
+  {
+    std::lock_guard<std::mutex> lock(g_callsites_mu);
+    g_seen_callsites.clear();
+  }
   g_enabled.store(true);
   Py_RETURN_NONE;
 }
@@ -518,6 +601,12 @@ static PyObject *py_disable(PyObject * /*self*/, PyObject * /*args*/) {
   {
     std::lock_guard<std::mutex> lock(g_threads_mu);
     g_allowed_thread_idents.clear();
+  }
+  // Clear dedupe state
+  g_once_per_line.store(false);
+  {
+    std::lock_guard<std::mutex> lock(g_callsites_mu);
+    g_seen_callsites.clear();
   }
   Py_RETURN_NONE;
 }

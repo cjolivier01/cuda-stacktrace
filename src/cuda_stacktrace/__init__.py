@@ -3,7 +3,7 @@ User-friendly Python API for CUDA stack tracing via CUPTI.
 
 This package wraps the native extension (cuda_stacktrace._native) and exposes:
 
-- enable(api_names, domains=("runtime",), site="enter", only_current_thread=False, thread_idents=None)
+- enable(api_names, domains=("runtime",), site="enter", only_current_thread=False, thread_idents=None, once_per_line=False)
 - disable() / is_enabled()
 - set_functions(api_names)
 - CudaStackTracer context manager for scoped tracing
@@ -34,6 +34,7 @@ def enable(
     site: str = "enter",
     only_current_thread: bool = False,
     thread_idents: Optional[_Iterable[int]] = None,
+    once_per_line: bool = False,
 ) -> None:
     """Enable stack printing for selected CUDA API names.
 
@@ -42,6 +43,8 @@ def enable(
     - site: "enter" or "exit"
     - only_current_thread: if True, only log for the thread that called enable()
     - thread_idents: iterable of Python thread idents (ints) to allow
+    - once_per_line: if True, print only the first stack for each originating
+      Python callsite (filename:lineno of the bottommost frame)
     """
     _ext.enable(
         api_names,
@@ -49,6 +52,7 @@ def enable(
         site=site,
         only_current_thread=bool(only_current_thread),
         thread_idents=list(thread_idents) if thread_idents is not None else None,
+        once_per_line=bool(once_per_line),
     )
 
 
@@ -74,6 +78,7 @@ def start(
     site: str = "enter",
     only_current_thread: bool = False,
     thread_idents: Optional[_Iterable[int]] = None,
+    once_per_line: bool = False,
 ) -> None:
     """Alias for enable(api_names, domains=..., site=...)."""
     enable(
@@ -82,6 +87,7 @@ def start(
         site=site,
         only_current_thread=only_current_thread,
         thread_idents=thread_idents,
+        once_per_line=once_per_line,
     )
 
 
@@ -108,6 +114,7 @@ class CudaStackTracer:
         domains: Iterable[str] | None = ("runtime",),
         site: str = "enter",
         stream=None,
+        once_per_line: bool = False,
     ) -> None:
         self.functions = (
             [functions]
@@ -129,6 +136,7 @@ class CudaStackTracer:
         self.domains = tuple(domains) if domains is not None else None
         self.site = site
         self.stream = stream
+        self.once_per_line = bool(once_per_line)
         self._prev_enabled: Optional[bool] = None
         self._redir_cm = None
 
@@ -145,6 +153,7 @@ class CudaStackTracer:
                     domains=self.domains,
                     site=self.site,
                     only_current_thread=self.only_current_thread,
+                    once_per_line=self.once_per_line,
                 )
             except RuntimeError:
                 # Re-raise to make failures explicit within context usage
