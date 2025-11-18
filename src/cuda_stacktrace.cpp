@@ -1,9 +1,14 @@
 // SPDX-License-Identifier: MIT
-// Build: links against CUPTI and pybind11. See setup.py / pyproject.toml.
-//
-// This extension subscribes to CUPTI callbacks for CUDA Runtime/Driver API
-// and, on selected API names, prints the Python call stack at the moment
-// of the call.
+/**
+ * @file cuda_stacktrace.cpp
+ * @brief CPython extension that prints Python stack traces when selected CUDA
+ *        APIs are called via CUPTI callbacks.
+ *
+ * The module exposes a minimal C API that is wrapped by the Python package
+ * `cuda_stacktrace`. It subscribes to CUPTI callbacks for the CUDA Runtime and
+ * Driver APIs and, for selected API names, emits the current Python call stack
+ * to @c stderr.
+ */
 
 #include <atomic>
 #include <cstdio>
@@ -19,8 +24,7 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 
-// Minimal CUPTI forward declarations to avoid requiring CUDA headers at build
-// time.
+/// Minimal CUPTI forward declarations to avoid requiring CUDA headers at build time.
 #ifndef CUPTIAPI
 #ifdef _WIN32
 #define CUPTIAPI __stdcall
@@ -35,7 +39,7 @@ typedef int CUpti_CallbackDomain;  // enum underlying type
 typedef int CUpti_CallbackId;      // enum underlying type
 typedef int CUpti_ApiCallbackSite; // enum underlying type
 
-// Known values from CUPTI headers (stable ABI)
+/// Known values from CUPTI headers (stable ABI).
 #ifndef CUPTI_SUCCESS
 #define CUPTI_SUCCESS 0
 #endif
@@ -52,7 +56,7 @@ typedef int CUpti_ApiCallbackSite; // enum underlying type
 #define CUPTI_API_EXIT 1
 #endif
 
-// Partial struct definition: we only access the first two fields.
+/// Partial struct definition: we only access the first two fields.
 typedef struct {
   CUpti_ApiCallbackSite callbackSite;
   const char *functionName;
@@ -73,14 +77,14 @@ CUptiResult CUPTIAPI cuptiGetResultString(CUptiResult result, const char **str);
 }
 
 // Note on what CUPTI provides:
-// - Callback API with enter/exit site (CUpti_ApiCallbackSite)
-// - For runtime/driver domains, CUpti_CallbackData::functionName is the API
-// name.
+// - Callback API with enter/exit site (CUpti_ApiCallbackSite).
+// - For runtime/driver domains, CUpti_CallbackData::functionName is the API name.
 //   NVIDIA docs state functionName is a global constant and valid to read.
 //   [docs] https://docs.nvidia.com/cupti/api/structCUpti__CallbackData.html
 
 // ---------- Helpers & Globals ----------
 
+/// Helper macro that wraps a CUPTI call and throws std::runtime_error on failure.
 #define CUPTI_CALL_THROW(call)                                                 \
   do {                                                                         \
     CUptiResult _status = (call);                                              \
@@ -98,36 +102,46 @@ static std::atomic<bool> g_subscribed{false};
 
 static CUpti_SubscriberHandle g_subscriber = nullptr;
 
-// Watched function names (exact match). Protected by mutex.
+/// Watched function names (exact match). Protected by mutex.
 static std::unordered_set<std::string> g_filters;
 static std::mutex g_filters_mu;
 
-// Domains and site we enabled
+/// Domains and site currently configured for callbacks.
 static std::atomic<bool> g_domain_runtime{true};
 static std::atomic<bool> g_domain_driver{false};
 static std::atomic<CUpti_ApiCallbackSite> g_site{CUPTI_API_ENTER};
 
-// Python objects cached (borrowed/owned refs)
+/// Cached Python traceback module (borrowed/owned references).
 static PyObject *g_traceback_mod = nullptr;
 static PyObject *g_format_stack_fn = nullptr;
+static PyObject *g_extract_stack_fn = nullptr;
 
-// Small reentrancy guard to avoid recursion if Python printing triggers
-// callbacks
+/// Small reentrancy guard to avoid recursion if Python printing triggers callbacks.
 thread_local bool tls_in_callback = false;
 
-// Optional thread filtering: only log when callback occurs on selected
-// Python thread idents. If g_filter_only_current_thread is true, then only the
-// thread that called enable() (whose ident is captured) is allowed. If
+// Optional thread filtering: only log when callback occurs on selected Python
+// thread idents. If g_filter_only_current_thread is true, then only the thread
+// that called enable() (whose ident is captured) is allowed. If
 // g_allowed_thread_idents is non-empty, any thread ident within is allowed.
 static std::atomic<bool> g_filter_only_current_thread{false};
 static long g_enable_thread_ident = -1; // ident captured at enable()
 static std::unordered_set<long> g_allowed_thread_idents; // optional allow-list
 static std::mutex g_threads_mu;
 
+// Optional: only print the first stack per originating Python callsite
+// (filename + line number of the bottommost Python frame).
+static std::atomic<bool> g_once_per_line{false};
+static std::unordered_set<std::string> g_seen_callsites;
+static std::mutex g_callsites_mu;
+
 // ---------- Python stack printing ----------
 
-// Try to join a Python list[str] into a single UTF-8 std::string without
-// allocating too much in C++.
+/**
+ * @brief Join a Python @c list[str] into a single UTF-8 encoded std::string.
+ *
+ * @param list_obj Python list of strings (borrowed reference).
+ * @return UTF-8 encoded concatenation of list elements; empty on error.
+ */
 static std::string py_list_join_to_string(PyObject *list_obj) {
   std::string out;
   if (!list_obj)
@@ -153,24 +167,47 @@ static std::string py_list_join_to_string(PyObject *list_obj) {
   return out;
 }
 
+/**
+ * @brief Ensure the traceback module and helper functions are imported.
+ *
+ * Must be called with the GIL held. On failure, clears any Python error and
+ * leaves the cached pointers null so the caller can handle the absence.
+ */
 static void ensure_traceback_objects_held_GIL() {
-  if (g_traceback_mod && g_format_stack_fn)
+  if (g_traceback_mod && g_format_stack_fn && g_extract_stack_fn)
     return;
-  g_traceback_mod = PyImport_ImportModule("traceback");
   if (!g_traceback_mod) {
-    PyErr_Clear();
-    return;
+    g_traceback_mod = PyImport_ImportModule("traceback");
+    if (!g_traceback_mod) {
+      PyErr_Clear();
+      return;
+    }
   }
-  g_format_stack_fn = PyObject_GetAttrString(g_traceback_mod, "format_stack");
   if (!g_format_stack_fn) {
-    PyErr_Clear();
-    Py_CLEAR(g_traceback_mod);
+    g_format_stack_fn = PyObject_GetAttrString(g_traceback_mod, "format_stack");
+    if (!g_format_stack_fn) {
+      PyErr_Clear();
+      Py_CLEAR(g_traceback_mod);
+      return;
+    }
+  }
+  if (!g_extract_stack_fn) {
+    g_extract_stack_fn = PyObject_GetAttrString(g_traceback_mod, "extract_stack");
+    if (!g_extract_stack_fn) {
+      PyErr_Clear();
+      // keep going; dedupe feature becomes unavailable
+    }
   }
 }
 
-// Fetch the current Python frame for *this* OS thread, if any.
-// We prefer PyThreadState_GetFrame (3.9+) and fall back to PyEval_GetFrame
-// (older).
+/**
+ * @brief Fetch the current Python frame for this OS thread (new reference).
+ *
+ * Uses @c PyThreadState_GetFrame on Python 3.9+ and falls back to
+ * @c PyEval_GetFrame on older versions.
+ *
+ * @return New reference to the current frame object, or @c nullptr if none.
+ */
 static PyObject *get_current_frame_held_GIL() {
 #if PY_VERSION_HEX >= 0x03090000
   PyThreadState *tstate = PyThreadState_Get();
@@ -188,6 +225,12 @@ static PyObject *get_current_frame_held_GIL() {
 
 // ---------- CUPTI callback ----------
 
+/**
+ * @brief Check whether a given CUDA API function name should be logged.
+ *
+ * @param functionName CUDA API name from CUPTI callback data.
+ * @return true if logging is enabled for the function; false otherwise.
+ */
 static bool should_log_for(const char *functionName) {
   if (!functionName)
     return false;
@@ -197,6 +240,12 @@ static bool should_log_for(const char *functionName) {
   return (g_filters.find(functionName) != g_filters.end());
 }
 
+/**
+ * @brief Convert a CUPTI callback domain to a human-readable string.
+ *
+ * @param d CUPTI callback domain enum value.
+ * @return "runtime", "driver", or "other".
+ */
 static const char *domain_str(CUpti_CallbackDomain d) {
   switch (d) {
   case CUPTI_CB_DOMAIN_RUNTIME_API:
@@ -208,6 +257,19 @@ static const char *domain_str(CUpti_CallbackDomain d) {
   }
 }
 
+/**
+ * @brief CUPTI callback invoked for CUDA Runtime/Driver API calls.
+ *
+ * This function acquires the Python GIL, applies thread and function filters,
+ * captures the current Python stack, and prints it to @c stderr. It also
+ * implements optional once-per-line deduplication by originating Python
+ * callsite.
+ *
+ * @param userdata User data supplied during subscription (unused).
+ * @param domain CUPTI callback domain (runtime or driver).
+ * @param cbid CUPTI callback identifier (unused).
+ * @param cbInfo Pointer to callback data describing the CUDA API call.
+ */
 extern "C" void CUPTIAPI cupti_callback(void * /*userdata*/,
                                         CUpti_CallbackDomain domain,
                                         CUpti_CallbackId /*cbid*/,
@@ -280,6 +342,61 @@ extern "C" void CUPTIAPI cupti_callback(void * /*userdata*/,
             "-------\n";
 
   if (g_format_stack_fn) {
+    // If once-per-line mode is enabled, attempt to extract the bottommost
+    // frame's filename+lineno and dedupe on that key.
+    if (g_once_per_line.load() && g_extract_stack_fn) {
+      PyObject *summ_list = PyObject_CallFunction(g_extract_stack_fn, "O", frame);
+      if (!summ_list) {
+        PyErr_Clear();
+      } else if (PyList_Check(summ_list) && PyList_Size(summ_list) > 0) {
+        PyObject *last = PyList_GetItem(summ_list, PyList_Size(summ_list) - 1); // borrowed
+        if (last) {
+          PyObject *filename = PyObject_GetAttrString(last, "filename");
+          PyObject *lineno = PyObject_GetAttrString(last, "lineno");
+          const char *fname = nullptr;
+          long line = -1;
+          if (filename) {
+            fname = PyUnicode_Check(filename) ? PyUnicode_AsUTF8(filename) : nullptr;
+          }
+          if (lineno) {
+            if (PyLong_Check(lineno))
+              line = PyLong_AsLong(lineno);
+          }
+          if (fname && line >= 0 && !PyErr_Occurred()) {
+            std::string key(fname);
+            key.push_back(':');
+            key.append(std::to_string(line));
+            bool seen = false;
+            {
+              std::lock_guard<std::mutex> lock(g_callsites_mu);
+              auto it = g_seen_callsites.find(key);
+              if (it != g_seen_callsites.end()) {
+                seen = true;
+              } else {
+                g_seen_callsites.insert(std::move(key));
+              }
+            }
+            if (seen) {
+              // Skip printing entirely; cleanup and exit without emitting header/footer.
+              Py_DECREF(frame);
+              Py_DECREF(summ_list);
+              if (filename)
+                Py_DECREF(filename);
+              if (lineno)
+                Py_DECREF(lineno);
+              PyGILState_Release(gil_state);
+              tls_in_callback = false;
+              return;
+            }
+          }
+          if (filename)
+            Py_DECREF(filename);
+          if (lineno)
+            Py_DECREF(lineno);
+        }
+        Py_DECREF(summ_list);
+      }
+    }
     // Call traceback.format_stack(frame)
     PyObject *list_obj = PyObject_CallFunction(g_format_stack_fn, "O", frame);
     Py_DECREF(frame);
@@ -312,7 +429,12 @@ extern "C" void CUPTIAPI cupti_callback(void * /*userdata*/,
 
 // ---------- Subscription management ----------
 
-// Best-effort: initialize CUDA driver to appease CUPTI on some systems.
+/**
+ * @brief Best-effort attempt to initialize the CUDA driver via @c cuInit().
+ *
+ * Some systems require the driver to be initialized before CUPTI will accept
+ * subscriptions. Failures here are ignored on purpose.
+ */
 static void try_cuInit() {
   void *h = dlopen("libcuda.so", RTLD_LAZY | RTLD_LOCAL);
   if (!h)
@@ -325,6 +447,18 @@ static void try_cuInit() {
   dlclose(h);
 }
 
+/**
+ * @brief Subscribe to CUPTI callbacks if not already subscribed.
+ *
+ * Enables the requested runtime/driver domains and installs the global
+ * @c cupti_callback handler. If already subscribed, only domain enablement
+ * is updated.
+ *
+ * @param runtime Whether to enable the runtime API domain.
+ * @param driver Whether to enable the driver API domain.
+ *
+ * @throws std::runtime_error if any CUPTI operation fails.
+ */
 static void subscribe_if_needed(bool runtime, bool driver) {
   if (g_subscribed.load()) {
     // Re-enable/disable domains depending on requested flags.
@@ -346,6 +480,12 @@ static void subscribe_if_needed(bool runtime, bool driver) {
                                      CUPTI_CB_DOMAIN_DRIVER_API));
 }
 
+/**
+ * @brief Unsubscribe from CUPTI callbacks if currently subscribed.
+ *
+ * Attempts to disable all domains and releases the CUPTI subscriber handle.
+ * Errors are ignored deliberately to keep teardown best-effort.
+ */
 static void unsubscribe_if_needed() {
   if (!g_subscribed.load())
     return;
@@ -359,6 +499,14 @@ static void unsubscribe_if_needed() {
 
 // ---------- CPython Module API ----------
 
+/**
+ * @brief Convert a Python iterable of strings into a @c std::vector<std::string>.
+ *
+ * @param obj Python iterable object (borrowed reference) or @c nullptr.
+ * @param out Output vector that will be cleared and filled with UTF-8 strings.
+ * @param what Human-readable description used for error messages.
+ * @return true on success; false if a Python error is raised.
+ */
 static bool convert_iterable_of_str(PyObject *obj,
                                     std::vector<std::string> &out,
                                     const char *what) {
@@ -395,19 +543,33 @@ static bool convert_iterable_of_str(PyObject *obj,
   return true;
 }
 
+/**
+ * @brief Python binding for @c enable().
+ *
+ * Parses arguments, updates global filters and thread settings, and subscribes
+ * to CUPTI as needed.
+ *
+ * @param self Unused module object.
+ * @param args Positional arguments.
+ * @param kwargs Keyword arguments.
+ * @return @c Py_None on success, or @c nullptr on error.
+ */
 static PyObject *py_enable(PyObject * /*self*/, PyObject *args,
                            PyObject *kwargs) {
   static const char *kwlist[] = {"api_names",     "domains",
                                  "site",          "only_current_thread",
-                                 "thread_idents", nullptr};
+                                 "thread_idents", "once_per_line",
+                                 nullptr};
   PyObject *api_names = nullptr;
   PyObject *domains = nullptr;
   const char *site = "enter";
   int only_current_thread = 0;
   PyObject *thread_idents = nullptr;
-  if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|OspO", (char **)kwlist,
+  int once_per_line = 0;
+  if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|OspOi", (char **)kwlist,
                                    &api_names, &domains, &site,
-                                   &only_current_thread, &thread_idents)) {
+                                   &only_current_thread, &thread_idents,
+                                   &once_per_line)) {
     return nullptr;
   }
 
@@ -505,10 +667,26 @@ static PyObject *py_enable(PyObject * /*self*/, PyObject *args,
     PyErr_SetString(PyExc_RuntimeError, e.what());
     return nullptr;
   }
+  // Configure once-per-line dedupe state
+  g_once_per_line.store(once_per_line != 0);
+  {
+    std::lock_guard<std::mutex> lock(g_callsites_mu);
+    g_seen_callsites.clear();
+  }
   g_enabled.store(true);
   Py_RETURN_NONE;
 }
 
+/**
+ * @brief Python binding for @c disable().
+ *
+ * Disables logging, clears thread filters and deduplication state, and
+ * unsubscribes from CUPTI if necessary.
+ *
+ * @param self Unused module object.
+ * @param args Unused positional arguments.
+ * @return @c Py_None.
+ */
 static PyObject *py_disable(PyObject * /*self*/, PyObject * /*args*/) {
   g_enabled.store(false);
   unsubscribe_if_needed();
@@ -519,9 +697,24 @@ static PyObject *py_disable(PyObject * /*self*/, PyObject * /*args*/) {
     std::lock_guard<std::mutex> lock(g_threads_mu);
     g_allowed_thread_idents.clear();
   }
+  // Clear dedupe state
+  g_once_per_line.store(false);
+  {
+    std::lock_guard<std::mutex> lock(g_callsites_mu);
+    g_seen_callsites.clear();
+  }
   Py_RETURN_NONE;
 }
 
+/**
+ * @brief Python binding for @c set_functions().
+ *
+ * Replaces the current function allow-list without modifying the enabled state.
+ *
+ * @param self Unused module object.
+ * @param args Positional arguments containing the iterable of function names.
+ * @return @c Py_None on success, or @c nullptr on error.
+ */
 static PyObject *py_set_functions(PyObject * /*self*/, PyObject *args) {
   PyObject *api_names = nullptr;
   if (!PyArg_ParseTuple(args, "O", &api_names))
@@ -536,6 +729,13 @@ static PyObject *py_set_functions(PyObject * /*self*/, PyObject *args) {
   Py_RETURN_NONE;
 }
 
+/**
+ * @brief Python binding for @c is_enabled().
+ *
+ * @param self Unused module object.
+ * @param args Unused positional arguments.
+ * @return @c Py_True if logging is enabled; @c Py_False otherwise.
+ */
 static PyObject *py_is_enabled(PyObject * /*self*/, PyObject * /*args*/) {
   if (g_enabled.load())
     Py_RETURN_TRUE;
@@ -560,4 +760,9 @@ static struct PyModuleDef moduledef = {
     "Print Python stack whenever selected CUDA APIs are called (via CUPTI).",
     -1, module_methods, nullptr, nullptr, nullptr, nullptr};
 
+/**
+ * @brief Module initialization entry point for the CPython extension.
+ *
+ * @return Newly created module object.
+ */
 PyMODINIT_FUNC PyInit__native(void) { return PyModule_Create(&moduledef); }
