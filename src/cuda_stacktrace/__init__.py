@@ -107,7 +107,7 @@ class CudaStackTracer:
         local_thread_only: Optional[bool] = None,
         domains: Iterable[str] | None = ("runtime",),
         site: str = "enter",
-        stream=None,
+        output_stream=None,
     ) -> None:
         self.functions = (
             [functions]
@@ -128,7 +128,7 @@ class CudaStackTracer:
         )
         self.domains = tuple(domains) if domains is not None else None
         self.site = site
-        self.stream = stream
+        self.output_stream = output_stream
         self._prev_enabled: Optional[bool] = None
         self._redir_cm = None
 
@@ -150,8 +150,8 @@ class CudaStackTracer:
                 # Re-raise to make failures explicit within context usage
                 raise
 
-        if self.stream is not None:
-            self._redir_cm = redirect_stderr(self.stream)
+        if self.output_stream is not None:
+            self._redir_cm = redirect_stderr(self.output_stream)
             self._redir_cm.__enter__()
         return self
 
