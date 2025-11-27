@@ -8,6 +8,7 @@ Features
 - Domains: `"runtime"` and/or `"driver"`.
 - Callback site: `"enter"` or `"exit"`.
 - Optional thread filtering: only report for the thread that enabled tracing or a list of thread idents.
+- Optional once-per-line deduplication by originating Python callsite.
 - Enable/disable from Python at runtime.
 - Output goes to `stderr` with a clear prefix.
 
@@ -28,7 +29,48 @@ Build and Install
   - `pip install .`
 
 Usage
-Minimal example tracing `cudaMalloc` on runtime API entry:
+
+### Recommended: context manager (`CudaStackTracer`)
+
+Use the high-level context manager to scope tracing to a block of code. This is
+often the simplest way to track where CUDA calls originate:
+
+```python
+import ctypes
+from cuda_stacktrace import CudaStackTracer
+
+# Call a CUDA runtime function via ctypes; errors are okay for stack printing
+libcudart = ctypes.CDLL("libcudart.so")  # try lib names like libcudart.so.12/.13 if needed
+libcudart.cudaMalloc.argtypes = (ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t)
+libcudart.cudaMalloc.restype = ctypes.c_int
+
+with CudaStackTracer(functions=["cudaMalloc"], enabled=True, only_current_thread=True):
+    ptr = ctypes.c_void_p()
+    rc = libcudart.cudaMalloc(ctypes.byref(ptr), ctypes.c_size_t(4))
+```
+
+Output appears on `stderr` starting with something like:
+
+```
+[cuda_stacktrace] runtime/enter cudaMalloc
+<python stack frames here>
+```
+
+`CudaStackTracer` parameters:
+- `functions`: string or iterable of CUDA API names to watch (e.g., `["cudaMalloc"]`).
+- `domains`: `("runtime",)`, `("driver",)`, or `("runtime", "driver")`.
+- `site`: `"enter"` or `"exit"`.
+- `enabled`: whether to enable tracing inside the context.
+- `only_current_thread`: restrict logging to the thread that entered the context.
+- `stream`: optional file-like object to temporarily capture `stderr` output.
+- `once_per_line`: if `True`, only print the first stack per Python callsite.
+
+When the context exits, tracing is automatically disabled again if it was
+previously disabled on entry.
+
+### Lower-level API (`enable` / `disable`)
+
+You can also control tracing globally using the functional API:
 
 ```python
 import ctypes
@@ -47,13 +89,6 @@ rc = libcudart.cudaMalloc(ctypes.byref(ptr), ctypes.c_size_t(4))
 cst.disable()
 ```
 
-Output appears on `stderr` starting with:
-
-```
-[cuda_stacktrace] runtime/enter cudaMalloc
-<python stack frames here>
-```
-
 You can change domains and site:
 
 ```python
@@ -63,9 +98,12 @@ You can change domains and site:
 
 Python API
 - `enable(api_names, domains=("runtime",), site="enter", only_current_thread=False, thread_idents=None)`
+- `start(api_names, domains=("runtime",), site="enter", only_current_thread=False, thread_idents=None)` (alias for `enable`)
 - `disable()`
+- `stop()` (alias for `disable`)
 - `set_functions(api_names)`
 - `is_enabled() -> bool`
+- `CudaStackTracer(...)` context manager for scoped tracing
 
 Thread filtering
 - `only_current_thread=True` restricts logging to the Python thread that calls `enable(...)`.

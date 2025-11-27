@@ -1,16 +1,20 @@
 """
-User-friendly Python API for CUDA stack tracing via CUPTI.
+@file __init__.py
+@brief User-friendly Python API for CUDA stack tracing via CUPTI.
 
-This package wraps the native extension (cuda_stacktrace._native) and exposes:
+This package wraps the native extension :mod:`cuda_stacktrace._native` and
+exposes:
 
-- enable(api_names, domains=("runtime",), site="enter", only_current_thread=False, thread_idents=None)
-- disable() / is_enabled()
-- set_functions(api_names)
-- CudaStackTracer context manager for scoped tracing
+- :func:`enable` / :func:`start` to turn tracing on
+- :func:`disable` / :func:`stop` to turn tracing off
+- :func:`set_functions` to update the CUDA API allow-list
+- :func:`is_enabled` to query current state
+- :class:`CudaStackTracer` context manager for scoped tracing
 
 Notes:
-- stream: If provided, stderr is temporarily redirected to the given stream
-  within the context manager, so native output is captured there.
+- If ``stream`` is provided to :class:`CudaStackTracer`, @c stderr is
+  temporarily redirected to the given stream within the context manager, so
+  native output is captured there.
 """
 
 from __future__ import annotations
@@ -34,14 +38,21 @@ def enable(
     site: str = "enter",
     only_current_thread: bool = False,
     thread_idents: Optional[_Iterable[int]] = None,
+    once_per_line: bool = False,
 ) -> None:
-    """Enable stack printing for selected CUDA API names.
+    """@brief Enable stack printing for selected CUDA API names.
 
-    - api_names: iterable of CUDA API names to watch (exact names)
-    - domains: ("runtime",), ("driver",), or ("runtime", "driver")
-    - site: "enter" or "exit"
-    - only_current_thread: if True, only log for the thread that called enable()
-    - thread_idents: iterable of Python thread idents (ints) to allow
+    @param api_names Iterable of CUDA API names to watch (exact names).
+    @param domains Iterable of domains: ``("runtime",)``, ``("driver",)``,
+                   or ``("runtime", "driver")``. If @c None, defaults to runtime.
+    @param site Callback site to trace: ``"enter"`` or ``"exit"``.
+    @param only_current_thread If @c True, only log for the thread that called
+                               :func:`enable`.
+    @param thread_idents Iterable of Python thread identifiers (ints) to allow.
+                         Logging occurs only on those threads when provided.
+    @param once_per_line If @c True, print only the first stack for each
+                         originating Python callsite (filename:lineno of the
+                         bottommost frame).
     """
     _ext.enable(
         api_names,
@@ -49,21 +60,30 @@ def enable(
         site=site,
         only_current_thread=bool(only_current_thread),
         thread_idents=list(thread_idents) if thread_idents is not None else None,
+        once_per_line=bool(once_per_line),
     )
 
 
 def disable() -> None:
-    """Disable stack printing and detach CUPTI."""
+    """@brief Disable stack printing and detach CUPTI."""
     _ext.disable()
 
 
 def is_enabled() -> bool:
-    """Return whether logging is currently enabled."""
+    """@brief Query whether logging is currently enabled.
+
+    @return @c True if tracing is enabled; @c False otherwise.
+    """
     return bool(_ext.is_enabled())
 
 
 def set_functions(functions: Iterable[str]) -> None:
-    """Update the allow-list of CUDA API names without changing enabled state."""
+    """@brief Update the allow-list of CUDA API names.
+
+    This does not change whether tracing is currently enabled or disabled.
+
+    @param functions Iterable of CUDA API names (exact strings) to watch.
+    """
     _ext.set_functions(functions)
 
 
@@ -74,28 +94,39 @@ def start(
     site: str = "enter",
     only_current_thread: bool = False,
     thread_idents: Optional[_Iterable[int]] = None,
+    once_per_line: bool = False,
 ) -> None:
-    """Alias for enable(api_names, domains=..., site=...)."""
+    """@brief Alias for :func:`enable`.
+
+    This is a convenience wrapper that directly forwards arguments to
+    :func:`enable`.
+    """
     enable(
         api_names,
         domains=domains,
         site=site,
         only_current_thread=only_current_thread,
         thread_idents=thread_idents,
+        once_per_line=once_per_line,
     )
 
 
 def stop() -> None:
-    """Alias for disable()."""
+    """@brief Alias for :func:`disable`."""
     disable()
 
 
 class CudaStackTracer:
-    """Context manager for scoped CUDA stack tracing.
+    """@brief Context manager for scoped CUDA stack tracing.
 
     Example:
+    @code{.py}
+        from cuda_stacktrace import CudaStackTracer
+
         with CudaStackTracer(functions=["cudaMalloc", "cuStreamSynchronize"], enabled=True):
-            ... do CUDA work ...
+            # ... do CUDA work ...
+            pass
+    @endcode
     """
 
     def __init__(
@@ -108,7 +139,25 @@ class CudaStackTracer:
         domains: Iterable[str] | None = ("runtime",),
         site: str = "enter",
         output_stream=None,
+        once_per_line: bool = False,
     ) -> None:
+        """@brief Construct a new :class:`CudaStackTracer`.
+
+        @param functions Single CUDA API name or iterable of names to trace.
+                         If @c None or empty, all APIs in the selected domains
+                         are watched.
+        @param enabled If @c True, tracing is enabled upon entering the context.
+        @param only_current_thread If @c True, restrict tracing to the thread
+                                   that enters the context.
+        @param local_thread_only Deprecated alias for @p only_current_thread.
+        @param domains Iterable of domains: ``("runtime",)``, ``("driver",)``,
+                       or both. If @c None, defaults to runtime.
+        @param site Callback site: ``"enter"`` or ``"exit"``.
+        @param stream Optional file-like object used to temporarily redirect
+                      @c stderr while the context is active.
+        @param once_per_line If @c True, enable once-per-line deduplication
+                             based on Python callsite.
+        """
         self.functions = (
             [functions]
             if isinstance(functions, str)
@@ -129,10 +178,18 @@ class CudaStackTracer:
         self.domains = tuple(domains) if domains is not None else None
         self.site = site
         self.output_stream = output_stream
+        self.once_per_line = bool(once_per_line)
         self._prev_enabled: Optional[bool] = None
         self._redir_cm = None
 
     def __enter__(self):
+        """@brief Enter the tracing context.
+
+        Saves the previous enabled state, optionally updates the function
+        allow-list, and enables tracing according to the instance settings.
+
+        @return Self, so the context manager can be bound if desired.
+        """
         self._prev_enabled = is_enabled()
 
         if self.functions:
@@ -145,6 +202,7 @@ class CudaStackTracer:
                     domains=self.domains,
                     site=self.site,
                     only_current_thread=self.only_current_thread,
+                    once_per_line=self.once_per_line,
                 )
             except RuntimeError:
                 # Re-raise to make failures explicit within context usage
@@ -156,6 +214,16 @@ class CudaStackTracer:
         return self
 
     def __exit__(self, exc_type, exc, tb):
+        """@brief Exit the tracing context.
+
+        Restores any temporary stderr redirection and disables tracing again
+        if it was previously disabled on entry and this instance enabled it.
+
+        @param exc_type Exception type, if any.
+        @param exc Exception instance, if any.
+        @param tb Traceback object, if any.
+        @return Always @c False to propagate exceptions.
+        """
         if self._redir_cm is not None:
             self._redir_cm.__exit__(exc_type, exc, tb)
             self._redir_cm = None

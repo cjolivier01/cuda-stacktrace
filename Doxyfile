@@ -1,0 +1,28 @@
+PROJECT_NAME           = "cuda-stacktrace"
+OUTPUT_DIRECTORY       = "build/docs"
+
+# Source layout
+INPUT                  = src README.md
+RECURSIVE              = YES
+FILE_PATTERNS          = *.cpp *.h *.hpp *.py
+
+# Treat Python files as such
+EXTENSION_MAPPING      = py=Python
+
+# Extraction settings
+EXTRACT_ALL            = YES
+EXTRACT_PRIVATE        = YES
+EXTRACT_STATIC         = YES
+
+# Documentation style
+JAVADOC_AUTOBRIEF      = YES
+MARKDOWN_SUPPORT       = YES
+USE_MDFILE_AS_MAINPAGE = README.md
+
+# Output formats
+GENERATE_HTML          = YES
+GENERATE_LATEX         = NO
+
+# Misc
+QUIET                  = NO
+WARN_IF_UNDOCUMENTED   = YES
