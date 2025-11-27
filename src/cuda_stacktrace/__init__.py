@@ -138,7 +138,7 @@ class CudaStackTracer:
         local_thread_only: Optional[bool] = None,
         domains: Iterable[str] | None = ("runtime",),
         site: str = "enter",
-        output_stream=None,
+        output_stream = None,
         once_per_line: bool = False,
     ) -> None:
         """@brief Construct a new :class:`CudaStackTracer`.
@@ -153,7 +153,7 @@ class CudaStackTracer:
         @param domains Iterable of domains: ``("runtime",)``, ``("driver",)``,
                        or both. If @c None, defaults to runtime.
         @param site Callback site: ``"enter"`` or ``"exit"``.
-        @param stream Optional file-like object used to temporarily redirect
+        @param output_stream Optional file-like object used to temporarily redirect
                       @c stderr while the context is active.
         @param once_per_line If @c True, enable once-per-line deduplication
                              based on Python callsite.
