@@ -138,7 +138,7 @@ class CudaStackTracer:
         local_thread_only: Optional[bool] = None,
         domains: Iterable[str] | None = ("runtime",),
         site: str = "enter",
-        stream=None,
+        output_stream=None,
         once_per_line: bool = False,
     ) -> None:
         """@brief Construct a new :class:`CudaStackTracer`.
@@ -153,7 +153,7 @@ class CudaStackTracer:
         @param domains Iterable of domains: ``("runtime",)``, ``("driver",)``,
                        or both. If @c None, defaults to runtime.
         @param site Callback site: ``"enter"`` or ``"exit"``.
-        @param stream Optional file-like object used to temporarily redirect
+        @param output_stream Optional file-like object used to temporarily redirect
                       @c stderr while the context is active.
         @param once_per_line If @c True, enable once-per-line deduplication
                              based on Python callsite.
@@ -177,7 +177,7 @@ class CudaStackTracer:
         )
         self.domains = tuple(domains) if domains is not None else None
         self.site = site
-        self.stream = stream
+        self.output_stream = output_stream
         self.once_per_line = bool(once_per_line)
         self._prev_enabled: Optional[bool] = None
         self._redir_cm = None
@@ -190,6 +190,9 @@ class CudaStackTracer:
 
         @return Self, so the context manager can be bound if desired.
         """
+        if not self.enabled:
+            return
+
         self._prev_enabled = is_enabled()
 
         if self.functions:
@@ -208,8 +211,8 @@ class CudaStackTracer:
                 # Re-raise to make failures explicit within context usage
                 raise
 
-        if self.stream is not None:
-            self._redir_cm = redirect_stderr(self.stream)
+        if self.output_stream is not None:
+            self._redir_cm = redirect_stderr(self.output_stream)
             self._redir_cm.__enter__()
         return self
 
@@ -224,6 +227,9 @@ class CudaStackTracer:
         @param tb Traceback object, if any.
         @return Always @c False to propagate exceptions.
         """
+        if not self.enabled:
+            return
+
         if self._redir_cm is not None:
             self._redir_cm.__exit__(exc_type, exc, tb)
             self._redir_cm = None
