@@ -138,7 +138,7 @@ class CudaStackTracer:
         local_thread_only: Optional[bool] = None,
         domains: Iterable[str] | None = ("runtime",),
         site: str = "enter",
-        output_stream = None,
+        output_stream=None,
         once_per_line: bool = False,
     ) -> None:
         """@brief Construct a new :class:`CudaStackTracer`.
@@ -190,6 +190,9 @@ class CudaStackTracer:
 
         @return Self, so the context manager can be bound if desired.
         """
+        if not self.enabled:
+            return
+
         self._prev_enabled = is_enabled()
 
         if self.functions:
@@ -224,6 +227,9 @@ class CudaStackTracer:
         @param tb Traceback object, if any.
         @return Always @c False to propagate exceptions.
         """
+        if not self.enabled:
+            return
+
         if self._redir_cm is not None:
             self._redir_cm.__exit__(exc_type, exc, tb)
             self._redir_cm = None
