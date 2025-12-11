@@ -12,8 +12,11 @@
 
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <cxxabi.h>
 #include <dlfcn.h>
+#include <execinfo.h>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -258,6 +261,90 @@ static const char *domain_str(CUpti_CallbackDomain d) {
 }
 
 /**
+ * @brief Build the common header string used for both Python and native stacks.
+ */
+static std::string build_stack_header(CUpti_CallbackDomain domain,
+                                      const CUpti_CallbackData *cbInfo) {
+  std::string header;
+  header.reserve(256);
+  header += "=================================================================="
+            "=======\n";
+  header += "[cuda_stacktrace] ";
+  header += domain_str(domain);
+  header += "/";
+  header += (g_site.load() == CUPTI_API_ENTER ? "enter" : "exit");
+  header += " ";
+  header += (cbInfo && cbInfo->functionName ? cbInfo->functionName
+                                            : "(unknown)");
+  header += "\n";
+  header += "------------------------------------------------------------------"
+            "-------\n";
+  return header;
+}
+
+/**
+ * @brief Build the footer string used after stack printing.
+ */
+static std::string build_stack_footer() {
+  std::string footer;
+  footer.reserve(128);
+  footer += "=================================================================="
+            "=======\n";
+  return footer;
+}
+
+/**
+ * @brief Best-effort native backtrace to stderr when no Python frames exist.
+ *
+ * Uses glibc's execinfo routines; demangles symbols when possible and also
+ * prints the raw symbol line for addresses.
+ */
+static void print_native_backtrace() {
+#if defined(__linux__) || defined(__APPLE__)
+  void *addrs[64];
+  int n_frames =
+      ::backtrace(addrs, static_cast<int>(sizeof(addrs) / sizeof(addrs[0])));
+  if (n_frames <= 0) {
+    std::fprintf(stderr, "[cuda_stacktrace] (native backtrace unavailable)\n");
+    return;
+  }
+  char **symbols = ::backtrace_symbols(addrs, n_frames);
+  for (int i = 0; i < n_frames; ++i) {
+    const char *sym = symbols ? symbols[i] : nullptr;
+    if (!sym) {
+      std::fprintf(stderr, "  #%02d [unknown]\n", i);
+      continue;
+    }
+    const char *lparen = std::strchr(sym, '(');
+    const char *plus = lparen ? std::strchr(lparen, '+') : nullptr;
+    std::string demangled;
+    if (lparen && plus && lparen + 1 < plus) {
+      std::string mangled(lparen + 1, static_cast<size_t>(plus - lparen - 1));
+      int status = 0;
+      char *dem = abi::__cxa_demangle(mangled.c_str(), nullptr, nullptr, &status);
+      if (status == 0 && dem) {
+        demangled.assign(dem);
+      } else {
+        demangled.assign(mangled);
+      }
+      std::free(dem);
+    }
+    if (!demangled.empty()) {
+      std::fprintf(stderr, "  #%02d %s\n", i, demangled.c_str());
+      std::fprintf(stderr, "        %s\n", sym);
+    } else {
+      std::fprintf(stderr, "  #%02d %s\n", i, sym);
+    }
+  }
+  if (symbols)
+    std::free(symbols);
+#else
+  std::fprintf(stderr,
+               "[cuda_stacktrace] native backtrace not supported on this platform\n");
+#endif
+}
+
+/**
  * @brief CUPTI callback invoked for CUDA Runtime/Driver API calls.
  *
  * This function acquires the Python GIL, applies thread and function filters,
@@ -314,11 +401,14 @@ extern "C" void CUPTIAPI cupti_callback(void * /*userdata*/,
   // Determine whether this thread has Python frames.
   PyObject *frame = get_current_frame_held_GIL(); // new ref (or NULL)
   if (!frame) {
-    std::fprintf(
-        stderr,
-        "[cuda_stacktrace] %s/%s %s — no Python frames in this thread\n",
-        domain_str(domain), g_site.load() == CUPTI_API_ENTER ? "enter" : "exit",
-        cbInfo->functionName ? cbInfo->functionName : "(unknown)");
+    std::string header = build_stack_header(domain, cbInfo);
+    std::fwrite(header.data(), 1, header.size(), stderr);
+    std::fprintf(stderr,
+                 "[cuda_stacktrace] no Python frames in this thread; native "
+                 "backtrace:\n");
+    print_native_backtrace();
+    std::string footer = build_stack_footer();
+    std::fprintf(stderr, "%s\n", footer.c_str());
     std::fflush(stderr);
     PyGILState_Release(gil_state);
     tls_in_callback = false;
@@ -327,19 +417,7 @@ extern "C" void CUPTIAPI cupti_callback(void * /*userdata*/,
 
   ensure_traceback_objects_held_GIL();
 
-  std::string header;
-  header.reserve(1024);
-  header += "=================================================================="
-            "=======\n";
-  header += "[cuda_stacktrace] ";
-  header += domain_str(domain);
-  header += "/";
-  header += (g_site.load() == CUPTI_API_ENTER ? "enter" : "exit");
-  header += " ";
-  header += (cbInfo->functionName ? cbInfo->functionName : "(unknown)");
-  header += "\n";
-  header += "------------------------------------------------------------------"
-            "-------\n";
+  std::string header = build_stack_header(domain, cbInfo);
 
   if (g_format_stack_fn) {
     // If once-per-line mode is enabled, attempt to extract the bottommost
@@ -418,10 +496,7 @@ extern "C" void CUPTIAPI cupti_callback(void * /*userdata*/,
                  header.c_str());
     std::fflush(stderr);
   }
-  std::string footer;
-  footer.reserve(1024);
-  footer += "=================================================================="
-            "=======\n";
+  std::string footer = build_stack_footer();
   std::fprintf(stderr, "%s\n", footer.c_str());
   PyGILState_Release(gil_state);
   tls_in_callback = false;
