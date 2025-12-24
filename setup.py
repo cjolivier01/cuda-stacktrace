@@ -1,33 +1,56 @@
 from setuptools import setup, Extension, find_packages
 import os, platform
 
+
+def dedup_existing(paths):
+    out = []
+    for path in paths:
+        if path and os.path.isdir(path) and path not in out:
+            out.append(path)
+    return out
+
+
 CUDA_HOME = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH") or "/usr/local/cuda"
 CUPTI_HOME = os.environ.get("CUPTI_HOME") or os.path.join(CUDA_HOME, "extras", "CUPTI")
+ARCH = platform.machine()
 
-# Try to use CUPTI include dir if it exists, otherwise rely on system includes (e.g. /usr/include)
-include_dirs = []
-cupti_inc = os.path.join(CUPTI_HOME, "include")
-if os.path.isdir(cupti_inc):
-    include_dirs.append(cupti_inc)
+# Common include locations across recent CUDA layouts
+include_dirs = dedup_existing(
+    [
+        os.path.join(CUPTI_HOME, "include"),
+        os.path.join(CUDA_HOME, "include"),
+        os.path.join(CUDA_HOME, "extras", "CUPTI", "include"),
+        os.path.join(CUDA_HOME, "targets", f"{ARCH}-linux", "include"),
+        os.path.join(CUDA_HOME, "targets", "x86_64-linux", "include"),
+        os.path.join(CUDA_HOME, "targets", "sbsa-linux", "include"),
+    ]
+)
 
 libraries = ["cupti"]
-library_dirs = []  # rely on system linker paths by default
 
 system = platform.system()
 if system == "Windows":
-    library_dirs.append(os.path.join(CUPTI_HOME, "lib64"))
+    library_dirs = dedup_existing([os.path.join(CUPTI_HOME, "lib64")])
+    runtime_library_dirs = []
 elif system == "Darwin":
     # CUDA on macOS is generally unavailable; keep for completeness.
-    library_dirs.append(os.path.join(CUPTI_HOME, "lib"))
+    library_dirs = dedup_existing([os.path.join(CUPTI_HOME, "lib")])
+    runtime_library_dirs = []
 else:
-    # Linux
-    # Try lib64 first, fall back to lib
-    lib64 = os.path.join(CUPTI_HOME, "lib64")
-    lib   = os.path.join(CUPTI_HOME, "lib")
-    if os.path.isdir(lib64):
-        library_dirs.append(lib64)
-    elif os.path.isdir(lib):
-        library_dirs.append(lib)
+    # Linux: support both legacy extras/CUPTI paths and newer targets/ layouts
+    library_dirs = dedup_existing(
+        [
+            os.environ.get("CUPTI_LIBRARY_PATH"),
+            os.path.join(CUPTI_HOME, "lib64"),
+            os.path.join(CUPTI_HOME, "lib"),
+            os.path.join(CUDA_HOME, "lib64"),
+            os.path.join(CUDA_HOME, "targets", f"{ARCH}-linux", "lib"),
+            os.path.join(CUDA_HOME, "targets", "x86_64-linux", "lib"),
+            os.path.join(CUDA_HOME, "targets", "sbsa-linux", "lib"),
+            "/usr/lib/x86_64-linux-gnu",
+        ]
+    )
+    runtime_library_dirs = library_dirs
 
 ext_modules = [
     Extension(
@@ -37,6 +60,7 @@ ext_modules = [
         include_dirs=include_dirs,
         libraries=libraries,
         library_dirs=library_dirs,
+        runtime_library_dirs=runtime_library_dirs,
         extra_compile_args=["-std=c++17"],
         language="c++",
     ),
