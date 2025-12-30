@@ -19,6 +19,7 @@ Notes:
 
 from __future__ import annotations
 
+import ctypes
 from contextlib import redirect_stderr
 from typing import Iterable, Optional, Union, Iterable as _Iterable
 import warnings
@@ -181,6 +182,73 @@ class CudaStackTracer:
         self.once_per_line = bool(once_per_line)
         self._prev_enabled: Optional[bool] = None
         self._redir_cm = None
+        self._warned_missing = False
+
+    @staticmethod
+    def _load_first_library(candidates):
+        for name in candidates:
+            if not name:
+                continue
+            try:
+                return ctypes.CDLL(name)
+            except OSError:
+                continue
+        return None
+
+    def _warn_on_missing_functions(self):
+        if self._warned_missing or not self.functions:
+            return
+
+        # Default to runtime domain when not specified
+        domain_set = set(self.domains or ("runtime",))
+
+        libs = []
+        if "runtime" in domain_set:
+            libs.append(
+                self._load_first_library(
+                    [
+                        "libcudart.so",
+                        "libcudart.so.13",
+                        "libcudart.so.12",
+                        "libcudart.so.11.0",
+                        "libcudart.so.10.2",
+                    ]
+                )
+            )
+        if "driver" in domain_set:
+            libs.append(
+                self._load_first_library(
+                    [
+                        "libcuda.so",
+                        "libcuda.so.1",
+                    ]
+                )
+            )
+
+        libs = [lib for lib in libs if lib is not None]
+        if not libs:
+            return  # Cannot validate without a library
+
+        missing = []
+        for fn in self.functions:
+            found = False
+            for lib in libs:
+                try:
+                    getattr(lib, fn)
+                    found = True
+                    break
+                except AttributeError:
+                    continue
+            if not found:
+                missing.append(fn)
+
+        if missing:
+            self._warned_missing = True
+            warnings.warn(
+                f"CUDA APIs not found in loaded libraries: {', '.join(sorted(set(missing)))}",
+                RuntimeWarning,
+                stacklevel=3,
+            )
 
     def __enter__(self):
         """@brief Enter the tracing context.
@@ -197,6 +265,7 @@ class CudaStackTracer:
 
         if self.functions:
             set_functions(self.functions)
+            self._warn_on_missing_functions()
 
         if self.enabled:
             try:

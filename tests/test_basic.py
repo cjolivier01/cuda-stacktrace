@@ -132,6 +132,17 @@ def test_filtering_blocks_output(capfd):
     assert "cudaMalloc" not in captured.err
 
 
+def test_warns_on_missing_function():
+    tracer = cst.CudaStackTracer(functions=["DefinitelyNotAnApi"], domains=("runtime",), enabled=True)
+    with pytest.warns(RuntimeWarning) as record:
+        try:
+            with tracer:
+                pass
+        except RuntimeError as e:
+            pytest.skip(f"CUPTI not available/working here: {e}")
+    assert any("DefinitelyNotAnApi" in str(w.message) for w in record)
+
+
 def test_context_manager_scoped_enable(capfd):
     """Use the friendly context manager API."""
     # Ensure disabled to start
