@@ -40,6 +40,7 @@ def enable(
     only_current_thread: bool = False,
     thread_idents: Optional[_Iterable[int]] = None,
     once_per_line: bool = False,
+    only_on_error: bool = False,
 ) -> None:
     """@brief Enable stack printing for selected CUDA API names.
 
@@ -54,6 +55,8 @@ def enable(
     @param once_per_line If @c True, print only the first stack for each
                          originating Python callsite (filename:lineno of the
                          bottommost frame).
+    @param only_on_error If @c True, only log when the CUDA API returns an error.
+                         Requires @p site="exit".
     """
     _ext.enable(
         api_names,
@@ -62,6 +65,7 @@ def enable(
         only_current_thread=bool(only_current_thread),
         thread_idents=list(thread_idents) if thread_idents is not None else None,
         once_per_line=bool(once_per_line),
+        only_on_error=bool(only_on_error),
     )
 
 
@@ -96,6 +100,7 @@ def start(
     only_current_thread: bool = False,
     thread_idents: Optional[_Iterable[int]] = None,
     once_per_line: bool = False,
+    only_on_error: bool = False,
 ) -> None:
     """@brief Alias for :func:`enable`.
 
@@ -109,6 +114,7 @@ def start(
         only_current_thread=only_current_thread,
         thread_idents=thread_idents,
         once_per_line=once_per_line,
+        only_on_error=only_on_error,
     )
 
 
@@ -141,6 +147,7 @@ class CudaStackTracer:
         site: str = "enter",
         stream=None,
         once_per_line: bool = False,
+        only_on_error: bool = False,
     ) -> None:
         """@brief Construct a new :class:`CudaStackTracer`.
 
@@ -158,6 +165,8 @@ class CudaStackTracer:
                       @c stderr while the context is active.
         @param once_per_line If @c True, enable once-per-line deduplication
                              based on Python callsite.
+        @param only_on_error If @c True, only log when the CUDA API returns an
+                             error. Requires @p site="exit".
         """
         self.functions = (
             [functions]
@@ -180,6 +189,7 @@ class CudaStackTracer:
         self.site = site
         self.stream = stream
         self.once_per_line = bool(once_per_line)
+        self.only_on_error = bool(only_on_error)
         self._prev_enabled: Optional[bool] = None
         self._redir_cm = None
         self._warned_missing = False
@@ -272,6 +282,7 @@ class CudaStackTracer:
                     site=self.site,
                     only_current_thread=self.only_current_thread,
                     once_per_line=self.once_per_line,
+                    only_on_error=self.only_on_error,
                 )
             except RuntimeError:
                 # Re-raise to make failures explicit within context usage

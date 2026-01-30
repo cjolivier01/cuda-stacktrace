@@ -9,6 +9,7 @@ Features
 - Callback site: `"enter"` or `"exit"`.
 - Optional thread filtering: only report for the thread that enabled tracing or a list of thread idents.
 - Optional once-per-line deduplication by originating Python callsite.
+- Optional only-on-error logging (requires `site="exit"`).
 - Enable/disable from Python at runtime.
 - Output goes to `stderr` with a clear prefix.
 
@@ -64,6 +65,7 @@ Output appears on `stderr` starting with something like:
 - `only_current_thread`: restrict logging to the thread that entered the context.
 - `stream`: optional file-like object to temporarily capture `stderr` output.
 - `once_per_line`: if `True`, only print the first stack per Python callsite.
+- `only_on_error`: if `True`, only print when the CUDA API returns an error (requires `site="exit"`).
 
 When the context exits, tracing is automatically disabled again if it was
 previously disabled on entry.
@@ -97,8 +99,8 @@ You can change domains and site:
 ```
 
 Python API
-- `enable(api_names, domains=("runtime",), site="enter", only_current_thread=False, thread_idents=None)`
-- `start(api_names, domains=("runtime",), site="enter", only_current_thread=False, thread_idents=None)` (alias for `enable`)
+- `enable(api_names, domains=("runtime",), site="enter", only_current_thread=False, thread_idents=None, once_per_line=False, only_on_error=False)`
+- `start(api_names, domains=("runtime",), site="enter", only_current_thread=False, thread_idents=None, once_per_line=False, only_on_error=False)` (alias for `enable`)
 - `disable()`
 - `stop()` (alias for `disable`)
 - `set_functions(api_names)`
@@ -127,6 +129,6 @@ Tests
 
 Implementation Notes
 - Implemented as a CPython C extension; no pybind11 dependency.
-- Uses CUPTI callback API and only accesses the `callbackSite` and `functionName` fields for compatibility.
+- Uses CUPTI callback API and only accesses the early `callbackSite`, `functionName`, and `functionReturnValue` fields for compatibility.
 - Acquires the Python GIL in the callback and formats the stack via `traceback.format_stack`.
 - A small reentrancy guard prevents recursive callbacks during printing.

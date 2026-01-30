@@ -59,10 +59,13 @@ typedef int CUpti_ApiCallbackSite; // enum underlying type
 #define CUPTI_API_EXIT 1
 #endif
 
-/// Partial struct definition: we only access the first two fields.
+/// Partial struct definition: we only access the first few fields.
+/// The layout matches the CUPTI header for these fields.
 typedef struct {
   CUpti_ApiCallbackSite callbackSite;
   const char *functionName;
+  const void *functionParams;
+  void *functionReturnValue;
 } CUpti_CallbackData;
 
 typedef void(CUPTIAPI *CUpti_CallbackFunc)(void *, CUpti_CallbackDomain,
@@ -113,6 +116,7 @@ static std::mutex g_filters_mu;
 static std::atomic<bool> g_domain_runtime{true};
 static std::atomic<bool> g_domain_driver{false};
 static std::atomic<CUpti_ApiCallbackSite> g_site{CUPTI_API_ENTER};
+static std::atomic<bool> g_only_on_error{false};
 
 /// Cached Python traceback module (borrowed/owned references).
 static PyObject *g_traceback_mod = nullptr;
@@ -264,7 +268,9 @@ static const char *domain_str(CUpti_CallbackDomain d) {
  * @brief Build the common header string used for both Python and native stacks.
  */
 static std::string build_stack_header(CUpti_CallbackDomain domain,
-                                      const CUpti_CallbackData *cbInfo) {
+                                      const CUpti_CallbackData *cbInfo,
+                                      bool has_error,
+                                      int error_code) {
   std::string header;
   header.reserve(256);
   header += "=================================================================="
@@ -272,10 +278,15 @@ static std::string build_stack_header(CUpti_CallbackDomain domain,
   header += "[cuda_stacktrace] ";
   header += domain_str(domain);
   header += "/";
-  header += (g_site.load() == CUPTI_API_ENTER ? "enter" : "exit");
+  header += (cbInfo && cbInfo->callbackSite == CUPTI_API_ENTER ? "enter"
+                                                               : "exit");
   header += " ";
   header += (cbInfo && cbInfo->functionName ? cbInfo->functionName
                                             : "(unknown)");
+  if (has_error) {
+    header += " error=";
+    header += std::to_string(error_code);
+  }
   header += "\n";
   header += "------------------------------------------------------------------"
             "-------\n";
@@ -373,6 +384,19 @@ extern "C" void CUPTIAPI cupti_callback(void * /*userdata*/,
   if (!should_log_for(cbInfo->functionName))
     return;
 
+  int error_code = 0;
+  bool has_error = false;
+  if (g_only_on_error.load()) {
+    if (cbInfo->callbackSite != CUPTI_API_EXIT)
+      return;
+    if (cbInfo->functionReturnValue) {
+      error_code = *reinterpret_cast<const int *>(cbInfo->functionReturnValue);
+      has_error = (error_code != 0);
+    }
+    if (!has_error)
+      return;
+  }
+
   tls_in_callback = true;
 
   // Acquire GIL (needed both for optional thread filtering and stack capture).
@@ -401,7 +425,7 @@ extern "C" void CUPTIAPI cupti_callback(void * /*userdata*/,
   // Determine whether this thread has Python frames.
   PyObject *frame = get_current_frame_held_GIL(); // new ref (or NULL)
   if (!frame) {
-    std::string header = build_stack_header(domain, cbInfo);
+    std::string header = build_stack_header(domain, cbInfo, has_error, error_code);
     std::fwrite(header.data(), 1, header.size(), stderr);
     std::fprintf(stderr,
                  "[cuda_stacktrace] no Python frames in this thread; native "
@@ -417,7 +441,7 @@ extern "C" void CUPTIAPI cupti_callback(void * /*userdata*/,
 
   ensure_traceback_objects_held_GIL();
 
-  std::string header = build_stack_header(domain, cbInfo);
+  std::string header = build_stack_header(domain, cbInfo, has_error, error_code);
 
   if (g_format_stack_fn) {
     // If once-per-line mode is enabled, attempt to extract the bottommost
@@ -634,6 +658,7 @@ static PyObject *py_enable(PyObject * /*self*/, PyObject *args,
   static const char *kwlist[] = {"api_names",     "domains",
                                  "site",          "only_current_thread",
                                  "thread_idents", "once_per_line",
+                                 "only_on_error",
                                  nullptr};
   PyObject *api_names = nullptr;
   PyObject *domains = nullptr;
@@ -641,10 +666,11 @@ static PyObject *py_enable(PyObject * /*self*/, PyObject *args,
   int only_current_thread = 0;
   PyObject *thread_idents = nullptr;
   int once_per_line = 0;
-  if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|OspOi", (char **)kwlist,
+  int only_on_error = 0;
+  if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|OspOii", (char **)kwlist,
                                    &api_names, &domains, &site,
                                    &only_current_thread, &thread_idents,
-                                   &once_per_line)) {
+                                   &once_per_line, &only_on_error)) {
     return nullptr;
   }
 
@@ -693,6 +719,11 @@ static PyObject *py_enable(PyObject * /*self*/, PyObject *args,
     g_site.store(CUPTI_API_EXIT);
   else {
     PyErr_SetString(PyExc_ValueError, "site must be 'enter' or 'exit'");
+    return nullptr;
+  }
+  if (only_on_error && g_site.load() != CUPTI_API_EXIT) {
+    PyErr_SetString(PyExc_ValueError,
+                    "only_on_error requires site='exit'");
     return nullptr;
   }
 
@@ -744,6 +775,7 @@ static PyObject *py_enable(PyObject * /*self*/, PyObject *args,
   }
   // Configure once-per-line dedupe state
   g_once_per_line.store(once_per_line != 0);
+  g_only_on_error.store(only_on_error != 0);
   {
     std::lock_guard<std::mutex> lock(g_callsites_mu);
     g_seen_callsites.clear();
@@ -774,6 +806,7 @@ static PyObject *py_disable(PyObject * /*self*/, PyObject * /*args*/) {
   }
   // Clear dedupe state
   g_once_per_line.store(false);
+  g_only_on_error.store(false);
   {
     std::lock_guard<std::mutex> lock(g_callsites_mu);
     g_seen_callsites.clear();
